@@ -1,0 +1,34 @@
+{
+    "open-unlearning/saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget05_GradAscent/evals/TOFU_SUMMARY.json": {
+      "extraction_strength": 0.03265219234440614,
+      "forget_Q_A_Prob": 1.4012984643248171e-46,
+      "forget_Q_A_ROUGE": 0.0,
+      "forget_quality": 1.9426434495222354e-119,
+      "model_utility": 0.0,
+      "privleak": -20.792816809787812
+    },
+    "open-unlearning/saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget05_GradDiff/evals/TOFU_SUMMARY.json": {
+      "extraction_strength": 0.03265219234440614,
+      "forget_Q_A_Prob": 3.405155268309306e-45,
+      "forget_Q_A_ROUGE": 0.0,
+      "forget_quality": 7.770573798088942e-117,
+      "model_utility": 0.4911451942446514,
+      "privleak": 56.83814302747208
+    },
+    "open-unlearning/saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget05_NPO/evals/TOFU_SUMMARY.json": {
+      "extraction_strength": 0.058056901112053375,
+      "forget_Q_A_Prob": 0.05976099180130404,
+      "forget_Q_A_ROUGE": 0.2564856757567158,
+      "forget_quality": 0.7125821300149116,
+      "model_utility": 0.521682742017212,
+      "privleak": 38.51160601654461
+    },
+    "open-unlearning/saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget05_RMU/evals/TOFU_SUMMARY.json": {
+      "extraction_strength": 0.03265219234440614,
+      "forget_Q_A_Prob": 3.9218423641784735e-06,
+      "forget_Q_A_ROUGE": 0.04604642984112194,
+      "forget_quality": 3.602472544567432e-09,
+      "model_utility": 0.587086727552278,
+      "privleak": 48.2355708832755
+    }
+  }

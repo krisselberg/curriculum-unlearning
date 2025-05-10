@@ -48,6 +48,7 @@ def load_trainer(
     data_collator=None,
     evaluator=None,
     template_args=None,
+    base_model_path: str | None = None,
 ):
     trainer_args = trainer_cfg.args
     method_args = trainer_cfg.get("method_args", {})
@@ -60,6 +61,12 @@ def load_trainer(
     assert trainer_cls is not None, NotImplementedError(
         f"{trainer_handler_name} not implemented or not registered"
     )
+
+    # --- MODIFICATION START: Extract Curriculum Args ---
+    curriculum_strategy = trainer_cfg.get("curriculum_strategy", None)
+    curriculum_loss_cache_path = trainer_cfg.get("curriculum_loss_cache_path", None)
+    # --- MODIFICATION END ---
+
     trainer = trainer_cls(
         model=model,
         train_dataset=train_dataset,
@@ -69,7 +76,11 @@ def load_trainer(
         args=trainer_args,
         evaluator=evaluator,
         template_args=template_args,
-        **method_args,
+        # --- MODIFICATION START: Pass Curriculum Args Explicitly ---
+        curriculum_strategy=curriculum_strategy,
+        curriculum_loss_cache_path=curriculum_loss_cache_path,
+        # --- MODIFICATION END ---
+        **method_args,  # Pass other method-specific args from config
     )
     logger.info(
         f"{trainer_handler_name} Trainer loaded, output_dir: {trainer_args.output_dir}"

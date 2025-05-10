@@ -34,8 +34,121 @@ else:
 if is_deepspeed_available():
     import deepspeed
 
+from transformers import Trainer, AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data.sampler import Sampler
+import logging
+from tqdm import tqdm
+import os
+
+logger = logging.getLogger(__name__)
+
+class CurriculumSampler(Sampler[int]):
+    """Samples elements sequentially according to a pre-defined list of indices."""
+    def __init__(self, indices: List[int]):
+        self.indices = indices
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
 
 class UnlearnTrainer(FinetuneTrainer):
+    def __init__(
+        self,
+        curriculum_strategy: str | None = None, # e.g., "loss_hard_easy"
+        curriculum_loss_cache_path: str | None = None, # Path to PRE-COMPUTED losses
+        *args,
+        **kwargs,
+    ):
+        """
+        Initialize the trainer.
+
+        Args:
+            curriculum_strategy: Strategy for curriculum learning ('loss_hard_easy', 'loss_easy_hard', None).
+            curriculum_loss_cache_path: Path to load pre-computed curriculum losses from.
+            *args, **kwargs: Arguments passed to the parent Trainer.
+        """
+        super().__init__(*args, **kwargs)
+
+        self.curriculum_strategy = curriculum_strategy
+        self.curriculum_loss_cache_path = curriculum_loss_cache_path
+        self.sorted_indices = None # Will be populated here if possible
+
+        # --- Load Pre-computed Losses and Sort --- 
+        if self.curriculum_strategy and self.curriculum_loss_cache_path and self.train_dataset:
+            logger.info(f"Attempting to load pre-computed curriculum losses from: {self.curriculum_loss_cache_path}")
+            if os.path.exists(self.curriculum_loss_cache_path):
+                try:
+                    losses = torch.load(self.curriculum_loss_cache_path)
+                    if len(losses) == len(self.train_dataset):
+                        logger.info(f"Successfully loaded {len(losses)} pre-computed losses.")
+                        # --- Sort indices based on loaded loss --- 
+                        indices = list(range(len(self.train_dataset)))
+                        reverse_sort = self.curriculum_strategy == "loss_easy_hard"
+                        logger.info(f"Sorting {len(indices)} indices based on loaded losses. Strategy: {self.curriculum_strategy} (Reverse sort: {reverse_sort})")
+
+                        valid_pairs = [(i, l) for i, l in zip(indices, losses) if isinstance(l, (int, float)) and torch.isfinite(torch.tensor(l))]
+                        invalid_indices = [i for i, l in zip(indices, losses) if not (isinstance(l, (int, float)) and torch.isfinite(torch.tensor(l)))]
+
+                        if invalid_indices:
+                            logger.warning(f"Found {len(invalid_indices)} invalid loss values (NaN/Inf) in cache file. Placing these at the end.")
+
+                        sorted_valid = sorted(valid_pairs, key=lambda x: x[1], reverse=reverse_sort)
+                        self.sorted_indices = [i for i, l in sorted_valid] + invalid_indices
+                        logger.info("Finished sorting indices for curriculum based on loaded losses.")
+                    else:
+                        logger.error(f"Loaded loss count ({len(losses)}) doesn't match dataset size ({len(self.train_dataset)}). Disabling curriculum.")
+                        self.curriculum_strategy = None # Disable
+                except Exception as e:
+                    logger.error(f"Failed to load or process curriculum losses from {self.curriculum_loss_cache_path}: {e}. Disabling curriculum.", exc_info=True)
+                    self.curriculum_strategy = None # Disable
+            else:
+                logger.error(f"Curriculum loss cache file not found: {self.curriculum_loss_cache_path}. Curriculum disabled.")
+                self.curriculum_strategy = None # Disable
+        elif self.curriculum_strategy:
+             logger.warning("Curriculum strategy specified, but no loss cache path or train_dataset provided. Curriculum disabled.")
+             self.curriculum_strategy = None
+        else:
+            logger.info("No curriculum strategy specified.")
+        # --- End Loading Logic --- 
+
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training dataloader. If curriculum is enabled and successful,
+        it uses a sampler based on the pre-sorted indices.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_dataset = self.train_dataset
+        data_collator = self.data_collator
+
+        if self.curriculum_strategy and self.sorted_indices:
+             if len(self.sorted_indices) == len(train_dataset):
+                 logger.info(f"Using CurriculumSampler with {len(self.sorted_indices)} indices based on strategy: {self.curriculum_strategy}")
+                 train_sampler = CurriculumSampler(self.sorted_indices)
+             else:
+                  logger.error(f"CRITICAL: Sorted index count ({len(self.sorted_indices)}) mismatch with dataset size ({len(train_dataset)}). Falling back to default sampler.")
+                  train_sampler = self._get_train_sampler()
+        else:
+             if self.curriculum_strategy and not self.sorted_indices:
+                 logger.warning("Curriculum strategy was set, but sorted indices are not available. Falling back to default sampler.")
+             train_sampler = self._get_train_sampler()
+
+
+        return DataLoader(
+            train_dataset,
+            batch_size=self._train_batch_size,
+            sampler=train_sampler,
+            collate_fn=data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            worker_init_fn=getattr(self.args, 'worker_init_fn', None), 
+        )
+
     # Adapted from Huggingface DPO Trainer: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
     def _prepare_deepspeed(self, model):
         # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473

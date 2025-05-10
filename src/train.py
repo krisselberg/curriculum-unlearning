@@ -50,6 +50,9 @@ def main(cfg: DictConfig):
             tokenizer=tokenizer,
         )
 
+    # --- Extract base_model_path --- 
+    base_model_path = cfg.model.model_args.pretrained_model_name_or_path
+
     trainer, trainer_args = load_trainer(
         trainer_cfg=trainer_cfg,
         model=model,
@@ -59,6 +62,8 @@ def main(cfg: DictConfig):
         data_collator=collator,
         evaluator=evaluator,
         template_args=template_args,
+        # --- Pass base_model_path --- 
+        base_model_path=base_model_path,
     )
 
     if trainer_args.do_train:

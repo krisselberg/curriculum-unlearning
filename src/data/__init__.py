@@ -25,6 +25,9 @@ def _register_collator(collator_class):
 
 def _load_single_dataset(dataset_name, dataset_cfg: DictConfig, **kwargs):
     dataset_handler_name = dataset_cfg.get("handler")
+    # ---- DEBUG PRINT ----
+    print(f"DEBUG [_load_single_dataset]: dataset_name='{dataset_name}', dataset_cfg='{dataset_cfg}', handler='{dataset_handler_name}'")
+    # ---- END DEBUG ----
     assert dataset_handler_name is not None, ValueError(
         f"{dataset_name} handler not set"
     )
