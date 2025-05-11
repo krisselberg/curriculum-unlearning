@@ -41,8 +41,6 @@ Each script handles:
 - Running the training process with the specified configuration
 - Evaluating the trained model
 
-The expected results for these experiments are in [`docs/repro.md`](docs/repro.md).
-
 ---
 
 ## 📝 Citing this work
