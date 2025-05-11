@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, SequentialSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from omegaconf import OmegaConf, DictConfig
 from tqdm import tqdm
+import json
 
 # Assuming your project structure allows these imports
 # Adjust paths if necessary
@@ -55,6 +56,14 @@ def calculate_losses(
         logger.error(f"Data config file not found: {data_cfg_path}")
         sys.exit(1)
 
+    # --- 0. Determine Device ---
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        logger.info("CUDA is available. Using GPU.")
+    else:
+        device = torch.device("cpu")
+        logger.info("CUDA not available. Using CPU.")
+
     # --- 1. Load Model and Tokenizer to CPU ---
     logger.info(f"Loading tokenizer from {model_path}...")
     try:
@@ -68,17 +77,17 @@ def calculate_losses(
         logger.error(f"Failed to load tokenizer: {e}", exc_info=True)
         sys.exit(1)
 
-    logger.info(f"Loading model {model_path} onto CPU...")
+    logger.info(f"Loading model {model_path} onto {device.type.upper()}...")
     try:
-        # Load directly to CPU
+        # Load model directly to the target device
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             trust_remote_code=True,
-            # Explicitly use float32 for CPU stability
-            torch_dtype=torch.float32
+            torch_dtype=torch.float16 if device.type == 'cuda' else torch.float32
         )
+        model.to(device) # Move model to the selected device
         model.eval() # Set to evaluation mode
-        logger.info("Model loaded successfully on CPU.")
+        logger.info(f"Model loaded successfully on {device.type.upper()}.")
     except Exception as e:
         logger.error(f"Failed to load model: {e}", exc_info=True)
         sys.exit(1)
@@ -273,156 +282,71 @@ def calculate_losses(
         sampler=SequentialSampler(dataset), # Ensure original order
         collate_fn=collator,
         num_workers=num_workers,
-        pin_memory=False # Pinning memory is for GPU transfer
+        pin_memory=True if device.type == 'cuda' else False # Enable pin_memory for GPU
     )
 
     example_losses = []
-    logger.info(f"Calculating per-example losses on CPU for {len(dataset)} examples...")
+    logger.info(f"Calculating per-example losses on {device.type.upper()} for {len(dataset)} examples...")
     with torch.no_grad():
-        for batch_idx, batch in tqdm(enumerate(temp_loader), desc="Calculating Losses (CPU)"):
-            # Ensure batch is on CPU (should be default)
-            cpu_batch = {}
+        for batch_idx, batch in tqdm(enumerate(temp_loader), desc=f"Calculating Losses ({device.type.upper()})"):
+            # Move batch to the correct device
+            device_batch = {}
             for k, v in batch.items():
-                 if isinstance(v, torch.Tensor):
-                     cpu_batch[k] = v.to('cpu')
-                 else:
-                     cpu_batch[k] = v
-            batch = cpu_batch
+                if isinstance(v, torch.Tensor):
+                    device_batch[k] = v.to(device)
+                else:
+                    device_batch[k] = v
+            batch = device_batch
 
             # --- Extract Inputs (Adapt based on actual dataset structure) ---
-            # This logic needs to mirror the structure your dataset/collator provides
             model_inputs = {}
             labels = None
             if isinstance(batch.get("forget"), dict) and "input_ids" in batch["forget"]:
-                 forget_data = batch["forget"]
-                 model_inputs["input_ids"] = forget_data.get("input_ids")
-                 model_inputs["attention_mask"] = forget_data.get("attention_mask")
-                 labels = forget_data.get("labels", forget_data.get("input_ids"))
+                forget_data = batch["forget"]
+                model_inputs["input_ids"] = forget_data.get("input_ids")
+                model_inputs["attention_mask"] = forget_data.get("attention_mask")
+                labels = forget_data.get("labels", forget_data.get("input_ids"))
             elif "input_ids" in batch: # Standard case
-                 model_inputs["input_ids"] = batch.get("input_ids")
-                 model_inputs["attention_mask"] = batch.get("attention_mask")
-                 labels = batch.get("labels", batch.get("input_ids"))
-            # Add elif for DPO 'rejected_' if needed for your curriculum basis
-            # elif "rejected_input_ids" in batch: ...
+                model_inputs["input_ids"] = batch.get("input_ids")
+                model_inputs["attention_mask"] = batch.get("attention_mask")
+                labels = batch.get("labels", batch.get("input_ids"))
 
             if model_inputs.get("input_ids") is None or labels is None:
-                 logger.warning(f"Skipping batch: Could not find required input fields ('input_ids'/'labels', or 'forget' structure). Batch keys: {list(batch.keys())}")
-                 current_batch_size = len(next(iter(batch.values()))) if batch else 0 # Estimate batch size
-                 example_losses.extend([float('inf')] * current_batch_size)
-                 continue
-            # --- End Input Extraction ---
-
-            # --- Shape Check/Fix (Optional but safer) ---
-            try:
-                if model_inputs.get("input_ids") is not None:
-                    ids_tensor = model_inputs["input_ids"]
-                    if ids_tensor.dim() == 3 and ids_tensor.shape[0] == 1:
-                        ids_tensor = ids_tensor.squeeze(0)
-                        model_inputs["input_ids"] = ids_tensor
-                        if model_inputs.get("attention_mask") is not None:
-                             mask_tensor = model_inputs["attention_mask"]
-                             if mask_tensor.dim() == 3 and mask_tensor.shape[0] == 1:
-                                 model_inputs["attention_mask"] = mask_tensor.squeeze(0)
-                    if model_inputs["input_ids"].dim() != 2:
-                         raise ValueError(f"Final input_ids shape is not 2D: {model_inputs['input_ids'].shape}")
-            except Exception as shape_e:
-                 logger.warning(f"Skipping batch due to shape error: {shape_e}")
-                 current_batch_size = len(next(iter(batch.values()))) if batch else 0
-                 example_losses.extend([float('inf')] * current_batch_size)
-                 continue
-            # --- End Shape Check ---
-
-            # --- Perform forward pass and loss calculation ---
-            logger.debug(f"Batch {batch_idx} - Input Shapes: input_ids={model_inputs.get('input_ids').shape}, attention_mask={model_inputs.get('attention_mask').shape}, labels={labels.shape}")
-            logger.debug(f"Batch {batch_idx} - Input dtypes: input_ids={model_inputs.get('input_ids').dtype}, attention_mask={model_inputs.get('attention_mask').dtype}, labels={labels.dtype}")
-            log_limit = 5 # Log first 5 elements
-            if model_inputs.get('input_ids').numel() > 0:
-                 logger.debug(f"Batch {batch_idx} - input_ids[:{log_limit},{log_limit}]: {model_inputs.get('input_ids').view(-1)[:log_limit]}")
-            if labels.numel() > 0:
-                logger.debug(f"Batch {batch_idx} - labels[:{log_limit},{log_limit}]: {labels.view(-1)[:log_limit]}")
+                logger.warning(f"Skipping batch: Could not find required input fields ('input_ids'/'labels', or 'forget' structure). Batch keys: {list(batch.keys())}")
+                current_batch_size = len(next(iter(batch.values()))) if batch else 0 # Estimate batch size
+                example_losses.extend([float('inf')] * current_batch_size)
+                continue
 
             try:
                 outputs = model(**model_inputs)
-
-                # Log Logits
                 logits = outputs.logits
-                logger.debug(f"Batch {batch_idx} - Logits shape: {logits.shape}, dtype: {logits.dtype}")
-                if torch.isnan(logits).any():
-                    logger.warning(f"Batch {batch_idx} - Logits contain NaNs! Count: {torch.isnan(logits).sum()}")
-                if torch.isinf(logits).any():
-                    logger.warning(f"Batch {batch_idx} - Logits contain Infs! Count: {torch.isinf(logits).sum()}")
-                if logits.numel() > 0:
-                    logger.debug(f"Batch {batch_idx} - Logits stats: min={logits.min():.4f}, max={logits.max():.4f}, mean={logits.mean():.4f}")
-
+                
                 shift_logits = outputs.logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-
-                logger.debug(f"Batch {batch_idx} - Shifted logits shape: {shift_logits.shape}, dtype: {shift_logits.dtype}")
-                logger.debug(f"Batch {batch_idx} - Shifted labels shape: {shift_labels.shape}, dtype: {shift_labels.dtype}")
 
                 loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
                 flat_logits = shift_logits.view(-1, shift_logits.size(-1))
                 flat_labels = shift_labels.view(-1)
+
                 per_token_loss = loss_fct(flat_logits, flat_labels)
-
-                # Log Per-Token Loss
-                logger.debug(f"Batch {batch_idx} - Per-token loss shape: {per_token_loss.shape}, dtype: {per_token_loss.dtype}")
-                if torch.isnan(per_token_loss).any():
-                    logger.warning(f"Batch {batch_idx} - Per-token loss contains NaNs! Count: {torch.isnan(per_token_loss).sum()}")
-                if torch.isinf(per_token_loss).any():
-                    logger.warning(f"Batch {batch_idx} - Per-token loss contains Infs! Count: {torch.isinf(per_token_loss).sum()}")
-                if per_token_loss.numel() > 0:
-                    logger.debug(f"Batch {batch_idx} - Per-token loss stats: min={per_token_loss.min():.4f}, max={per_token_loss.max():.4f}, mean={per_token_loss.mean():.4f}")
-
                 per_token_loss = per_token_loss.view(shift_logits.size(0), shift_logits.size(1))
                 label_mask = (shift_labels != -100).float() # Ignore padding tokens
+
                 sum_loss_per_example = (per_token_loss * label_mask).sum(dim=1)
                 num_valid_tokens = label_mask.sum(dim=1).clamp(min=1) # Avoid division by zero
-
-                # Log Summed Loss and Valid Tokens
-                logger.debug(f"Batch {batch_idx} - Sum loss/example shape: {sum_loss_per_example.shape}, values[:{log_limit}]: {sum_loss_per_example[:log_limit]}")
-                logger.debug(f"Batch {batch_idx} - Num valid tokens shape: {num_valid_tokens.shape}, values[:{log_limit}]: {num_valid_tokens[:log_limit]}")
-
                 mean_loss_per_example = sum_loss_per_example / num_valid_tokens
 
-                # Log Mean Loss per Example
-                logger.debug(f"Batch {batch_idx} - Mean loss/example shape: {mean_loss_per_example.shape}, values[:{log_limit}]: {mean_loss_per_example[:log_limit]}")
-                if torch.isnan(mean_loss_per_example).any():
-                     logger.warning(f"Batch {batch_idx} - Mean loss/example contains NaNs! Count: {torch.isnan(mean_loss_per_example).sum()}")
-                if torch.isinf(mean_loss_per_example).any():
-                     logger.warning(f"Batch {batch_idx} - Mean loss/example contains Infs! Count: {torch.isinf(mean_loss_per_example).sum()}")
-
-                # --- Log Individual Sample Loss --- 
-                start_idx = batch_idx * batch_size
-                q_key = dataset.question_key # Assumes dataset object has question_key attr
-                for i in range(len(mean_loss_per_example)):
-                     current_dataset_idx = start_idx + i
-                     if current_dataset_idx < len(dataset.data):
-                          try:
-                               original_item = dataset.data[current_dataset_idx]
-                               question = original_item[q_key]
-                               loss_value = mean_loss_per_example[i].item()
-                               # Truncate question for cleaner logging if needed
-                               truncated_question = (question[:75] + '...') if len(question) > 75 else question
-                               logger.info(f"Sample {current_dataset_idx}: Loss={loss_value:.4f}, Q: '{truncated_question}'")
-                          except Exception as log_e:
-                               logger.warning(f"Could not log details for sample index {current_dataset_idx}: {log_e}")
-                     else:
-                          logger.warning(f"Skipping logging for index {current_dataset_idx}, out of bounds for dataset size {len(dataset.data)}")
-                # --- End Individual Logging --- 
-
-                example_losses.extend(mean_loss_per_example.cpu().tolist()) # Ensure losses are on CPU
+                # Move losses to CPU before converting to list
+                example_losses.extend(mean_loss_per_example.cpu().tolist())
 
             except Exception as forward_e:
                 logger.error(f"Batch {batch_idx} - Error during forward pass or loss calculation: {forward_e}", exc_info=True)
-                # Log input shapes that caused the error
-                logger.error(f"Batch {batch_idx} - Error occurred with Input Shapes: input_ids={model_inputs.get('input_ids').shape if model_inputs.get('input_ids') is not None else 'None'}, labels={labels.shape if labels is not None else 'None'}")
                 current_batch_size = model_inputs.get("input_ids").shape[0] if model_inputs.get("input_ids") is not None else batch_size
                 example_losses.extend([float('inf')] * current_batch_size)
-                continue # Skip to next batch if this one failed
+                continue
 
     if len(example_losses) != len(dataset):
-         logger.warning(f"Loss calculation mismatch. Expected {len(dataset)}, got {len(example_losses)}. Output file might be incomplete or curriculum may fail.")
+        logger.warning(f"Loss calculation mismatch. Expected {len(dataset)}, got {len(example_losses)}. Output file might be incomplete or curriculum may fail.")
 
     # --- 5. Save Losses ---
     logger.info(f"Saving {len(example_losses)} calculated losses to {output_path}...")
@@ -432,8 +356,59 @@ def calculate_losses(
             os.makedirs(output_dir, exist_ok=True)
         torch.save(example_losses, output_path)
         logger.info("Losses saved successfully.")
+
+        # Create JSON file with ordering information
+        json_output_path = output_path.replace('.pt', '_ordering.json')
+        logger.info(f"Saving ordering information to {json_output_path}...")
+        
+        # Get original indices and their corresponding losses
+        original_indices = list(range(len(example_losses)))
+        loss_index_pairs = list(zip(example_losses, original_indices))
+        
+        # Sort by loss value (descending for hard_easy, ascending for easy_hard)
+        # We'll save both orderings
+        hard_easy_sorted = sorted(loss_index_pairs, key=lambda x: x[0], reverse=True)
+        easy_hard_sorted = sorted(loss_index_pairs, key=lambda x: x[0])
+        
+        # Get question and answer keys from dataset
+        q_key = getattr(dataset, 'question_key', 'question')
+        a_key = getattr(dataset, 'answer_key', 'answer')
+        
+        # Create the JSON structure with QA pairs
+        ordering_info = {
+            "original_ordering": {
+                str(i): {
+                    "index": i,
+                    "loss": float(loss),
+                    "question": dataset.data[i][q_key] if hasattr(dataset, 'data') and i < len(dataset.data) else "N/A",
+                    "answer": dataset.data[i][a_key] if hasattr(dataset, 'data') and i < len(dataset.data) else "N/A"
+                } for i, loss in enumerate(example_losses)
+            },
+            "hard_easy_ordering": {
+                str(i): {
+                    "original_index": orig_idx,
+                    "loss": float(loss),
+                    "question": dataset.data[orig_idx][q_key] if hasattr(dataset, 'data') and orig_idx < len(dataset.data) else "N/A",
+                    "answer": dataset.data[orig_idx][a_key] if hasattr(dataset, 'data') and orig_idx < len(dataset.data) else "N/A"
+                } for i, (loss, orig_idx) in enumerate(hard_easy_sorted)
+            },
+            "easy_hard_ordering": {
+                str(i): {
+                    "original_index": orig_idx,
+                    "loss": float(loss),
+                    "question": dataset.data[orig_idx][q_key] if hasattr(dataset, 'data') and orig_idx < len(dataset.data) else "N/A",
+                    "answer": dataset.data[orig_idx][a_key] if hasattr(dataset, 'data') and orig_idx < len(dataset.data) else "N/A"
+                } for i, (loss, orig_idx) in enumerate(easy_hard_sorted)
+            }
+        }
+        
+        # Save the JSON file
+        with open(json_output_path, 'w') as f:
+            json.dump(ordering_info, f, indent=2)
+        logger.info("Ordering information saved successfully.")
+        
     except Exception as e:
-        logger.error(f"Failed to save losses: {e}", exc_info=True)
+        logger.error(f"Failed to save losses or ordering information: {e}", exc_info=True)
         sys.exit(1)
 
     logger.info("--- Curriculum Loss Calculation Finished ---")
